@@ -148,7 +148,7 @@ def ai_solve(image_b64: str, question: str, grid_type: str = "grid") -> list:
 
 # ─── 获取验证码 iframe 列表（简化版）──────────────────────────────
 def find_all_iframes(sb):
-    """用 JavaScript 获取所有 iframe，返回列表"""
+    """用 JavaScript 获取所有 iframe"""
     return sb.driver.find_elements(By.TAG_NAME, "iframe")
 
 
@@ -163,31 +163,29 @@ def get_recaptcha_token(sb):
 
 
 def find_challenge_iframe(sb):
-    """
-    找到验证码挑战弹窗的 iframe。
-    Selenium 原生 API, 不依赖 SeleniumBase 封装。
-    """
+    """找验证码挑战弹窗 iframe（用原生 driver.switch_to）"""
     try:
-        sb.switch_to.default_content()
+        sb.driver.switch_to.default_content()
         frames = find_all_iframes(sb)
         for frame in frames:
-            sb.switch_to.frame(frame)
-            # 检查是否有 rc-imageselect (验证码网格)
+            sb.driver.switch_to.frame(frame)
             try:
                 sb.driver.find_element(By.ID, "rc-imageselect")
-                sb.switch_to.default_content()
+                sb.driver.switch_to.default_content()
                 return frame
             except Exception:
                 pass
-            # 或者看 title 属性
             title = (frame.get_attribute("title") or "").lower()
             if "recaptcha challenge" in title:
-                sb.switch_to.default_content()
+                sb.driver.switch_to.default_content()
                 return frame
-            sb.switch_to.default_content()
+            sb.driver.switch_to.default_content()
         return None
     except Exception:
-        sb.switch_to.default_content()
+        try:
+            sb.driver.switch_to.default_content()
+        except Exception:
+            pass
         return None
 
 
@@ -252,23 +250,22 @@ def click_tiles(sb, nums):
 def solve_recaptcha(sb) -> bool:
     sb.sleep(2)
 
-    # Step 1: 找 checkbox iframe → 点击
     logger.info("寻找 checkbox...")
     try:
-        sb.switch_to.default_content()
+        sb.driver.switch_to.default_content()
         frames = find_all_iframes(sb)
         checkbox_found = False
         for frame in frames:
             try:
-                sb.switch_to.frame(frame)
+                sb.driver.switch_to.frame(frame)
                 cb = sb.driver.find_element(By.ID, "recaptcha-anchor")
                 cb.click()
                 logger.info("已点 checkbox")
                 checkbox_found = True
-                sb.switch_to.default_content()
+                sb.driver.switch_to.default_content()
                 break
             except Exception:
-                sb.switch_to.default_content()
+                sb.driver.switch_to.default_content()
                 continue
         
         if not checkbox_found:
