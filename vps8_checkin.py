@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 """
-VPS8.zz.cd 每日签到 — AI 视觉模型过验证码免费版
-──────────────────────────────────────────────────
-技术路线: SeleniumBase 浏览器 + AI视觉识别reCAPTCHA图片网格 
-多轮验证(通常5-6轮)
-──────────────────────────────────────────────────
-需要 GitHub Secrets:
-  VPS8_EMAIL / VPS8_PASSWORD    — 登录凭证
-  AI_API_KEY                    — AI API Key（需支持 vision）
-  AI_BASE_URL                   — AI API 地址（OpenAI 兼容）
-  AI_MODEL_NAME                 — AI 模型（推荐 gpt-4o / qwen-vl-max / claude-3.5-sonnet）
-  TELEGRAM_BOT_TOKEN / MY_CHAT_ID  — 通知（可选）
+VPS8.zz.cd 每日签到 — AI 视觉模型过 reCAPTCHA 免费版
+技术：SeleniumBase + AI 视觉 3x3 / 3x4 图片网格识别
+多轮识别（通常 5-6 轮）
+需要 Secret: VPS8_EMAIL, VPS8_PASSWORD, AI_API_KEY, AI_BASE_URL, AI_MODEL_NAME
 """
 
 import os, sys, time, json, re
@@ -19,11 +12,15 @@ from pathlib import Path
 from io import BytesIO
 
 import requests
+import base64
 from PIL import Image
 from seleniumbase import SB
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from loguru import logger
 
-# ─────────────────────────────────────────────
+# ─── 配置 ────────────────────────────────────────────────────
 BASE_URL       = os.environ.get("VPS8_BASE_URL", "https://vps8.zz.cd")
 LOGIN_URL      = f"{BASE_URL}/login"
 SIGNIN_URL     = f"{BASE_URL}/points/signin"
@@ -41,14 +38,13 @@ WORKSPACE = Path(os.environ.get("GITHUB_WORKSPACE", "."))
 OUTPUT_DIR = WORKSPACE / "output" / "vps8"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ──────────────────────────────────────────────
 logger.remove()
 logger.add(sys.stderr, level="INFO",
            format="<green>{time:HH:mm:ss}</green> | <level>{message}</level>")
 
 
-# ─── 通知 ─────────────────────────────────────────────────────
-def send_telegram(text: str) -> None:
+# ─── 通知 ──────────────────────────────────────────────────────
+def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not MY_CHAT_ID:
         return
     try:
@@ -61,111 +57,88 @@ def send_telegram(text: str) -> None:
         logger.warning(f"Telegram: {e}")
 
 
-# ─── 保存截图（调试用）─────────────────────────────────────────
-def save_debug_image(base64_str: str, name: str = "captcha") -> str:
+# ─── 保存截图（调试用）────────────────────────────────────────
+def save_b64(b64: str, name: str = "cap"):
     try:
-        img_data = base64.b64decode(base64_str)
-        path = OUTPUT_DIR / f"{name}.png"
-        path.write_bytes(img_data)
-        return str(path)
+        p = OUTPUT_DIR / f"{name}.png"
+        p.write_bytes(base64.b64decode(b64))
     except Exception:
-        return ""
+        pass
 
 
-# ─── AI 识别验证码 ─────────────────────────────────────────────
-def ai_solve_image_captcha(image_base64: str, question: str, grid_type: str = "grid") -> list:
-    """
-    AI 视觉模型识别 reCAPTCHA 图片网格。
-    返回应点击的图片编号列表（1-based，从左到右、从上到下）。
-
-    流程：
-    截图 → base64 → AI API → 解析返回数字 → [1, 4, 7]
-    """
+# ─── AI 识别验证码图片 ──────────────────────────────────────────
+def ai_solve(image_b64: str, question: str, grid_type: str = "grid") -> list:
     if not AI_API_KEY:
-        logger.error(" AI_API_KEY 未配置")
+        logger.error("AI_API_KEY 未配置")
         return []
 
-    # 网格维度
     if grid_type == "grid_3x4":
         rows, cols, max_tile = 4, 3, 12
     else:
         rows, cols, max_tile = 3, 3, 9
 
-    # 编号说明
-    numbering = []
+    numbering_parts = []
     for r in range(rows):
-        numbering.append(", ".join(str(r * cols + c + 1) for c in range(cols)))
-    numbering_text = "，".join(f"第{r+1}行: {n}" for r, n in enumerate(numbering))
+        nums = ", ".join(str(r * cols + c + 1) for c in range(cols))
+        numbering_parts.append(f"第{r+1}行: {nums}")
+    numbering_text = "，".join(numbering_parts)
 
     prompt = (
-        f"这是一个 reCAPTCHA 人机验证的图片选择题，网格尺寸为 {rows} 行 × {cols} 列。\n\n"
-        f"🔍 验证问题是：「{question}」\n\n"
-        f"格子编号规则：\n"
-        f"{numbering_text}\n\n"
-        f"请仔细观察图片中的每个格子，判断哪些格子包含问题中描述的物体。\n"
-        f"**只返回应点击的格子编号**，用逗号分隔，例如：1, 4, 7\n"
+        f"这是一个 reCAPTCHA 人机验证的图片选择题，网格为 {rows} 行 × {cols} 列。\n"
+        f"验证问题是：「{question}」\n\n"
+        f"格子编号规则：{numbering_text}\n\n"
+        f"请仔细观察每个格子，判断哪些格子包含问题中描述的物体。\n"
+        f"**只返回应点击的格子编号**，逗号分隔，例如：1, 4, 7\n"
+        f"如果没有符合的，返回空。\n"
         f"不要输出任何其他内容。"
     )
 
-    logger.info(f"🤖 AI 识别: {question[:80]}...")
-
-    # 保存调试截图
-    save_debug_image(image_base64, f"captcha_{int(time.time())}")
+    logger.info(f"AI 识别: {question[:80]}")
 
     try:
-        # 压缩图片到合理大小
-        img_bytes = base64.b64decode(image_base64)
-        img = Image.open(BytesIO(img_bytes))
+        img_img = Image.open(BytesIO(base64.b64decode(image_b64)))
         max_dim = 1024
-        if max(img.size) > max_dim:
-            ratio = max_dim / max(img.size)
-            img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
+        if max(img_img.size) > max_dim:
+            ratio = max_dim / max(img_img.size)
+            img_img = img_img.resize(
+                (int(img_img.width * ratio), int(img_img.height * ratio)),
+                Image.LANCZOS)
         buf = BytesIO()
-        img.save(buf, format="PNG")
+        img_img.save(buf, format="PNG")
         small_b64 = base64.b64encode(buf.getvalue()).decode()
+        save_b64(small_b64, "ai_input")
 
-        r = requests.post(
+        resp = requests.post(
             f"{AI_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {AI_API_KEY}",
+                "Content-Type": "application/json",
+            },
             json={
                 "model": AI_MODEL_NAME,
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": "你是一个验证码识别助手。你擅长准确识别 reCAPTCHA 图片网格中哪些格子包含指定的物体。你只返回编号，不返回其他内容。"
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": prompt,
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{small_b64}",
-                                    "detail": "high",
-                                },
-                            },
-                        ],
-                    },
-                ],
+                    {"role": "system",
+                     "content": "你是一个验证码识别专家。请准确识别 reCAPTCHA 图片网格中哪些格子包含指定物体，只返回编号列表。"},
+                    {"role": "user",
+                     "content": [
+                         {"type": "text", "text": prompt},
+                         {"type": "image_url", "image_url": {
+                             "url": f"data:image/png;base64,{small_b64}",
+                             "detail": "high",
+                         }}]}],
                 "max_tokens": 50,
                 "temperature": 0.1,
             },
             timeout=60,
         )
 
-        data = r.json()
+        data = resp.json()
         answer = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-        logger.info(f"🤖 返回: {answer}")
+        logger.info(f"AI 返回: {answer}")
 
-        # 解析编号
         nums = [int(n) for n in re.findall(r'\d+', answer)]
         nums = [n for n in nums if 1 <= n <= max_tile]
-        logger.info(f"✅ 结果: 点击 {nums}")
-        save_debug_image(small_b64, f"captcha_small_{int(time.time())}")
+        logger.info(f"解析结果: {nums}")
         return nums
 
     except Exception as e:
@@ -173,137 +146,15 @@ def ai_solve_image_captcha(image_base64: str, question: str, grid_type: str = "g
         return []
 
 
-# ─── reCAPTCHA v2 求解主逻辑 ────────────────────────────────────
-def solve_recaptcha(sb: "SB") -> bool:
-    """
-    完整解决 reCAPTCHA v2 图片验证。
+# ─── 获取验证码 iframe 列表（简化版）──────────────────────────────
+def find_all_iframes(sb):
+    """用 JavaScript 获取所有 iframe，返回列表"""
+    return sb.driver.find_elements(By.TAG_NAME, "iframe")
 
-    流程:
-    1. 切换 reCAPTCHA iframe → 点 checkbox
-    2. 等待验证弹窗出现
-    3. 切换到验证码挑战 iframe
-    4. 截图网格 → AI 识别 → 点格子
-    5. 点 Verify
-    6. 检查是否有新一轮 → 重复 3-5
-    7. 拿到 g-recaptcha-response token
 
-    返回 True 表示拿到 token。
-    """
+def get_recaptcha_token(sb):
     try:
-        sb.sleep(2)
-
-        # Step 1: 切换到 reCAPTCHA checkbox iframe 并点击
-        logger.info("寻找 reCAPTCHA checkbox...")
-        try:
-            sb.switch_to_frame("iframe[title*='recaptcha']")
-        except Exception:
-            # 备用：通过 src 属性找
-            try:
-                frames = sb.find_elements("css=iframe[src*='recaptcha']")
-                if frames:
-                    sb.driver.switch_to.frame(frames[0])
-                else:
-                    logger.warning("未找到 reCAPTCHA iframe")
-                    return False
-            except Exception as e:
-                logger.warning(f"找 iframe 出错: {e}")
-                return False
-
-        try:
-            checkbox = sb.find_element("#recaptcha-anchor")
-            checkbox.click()
-            logger.info("已点击 checkbox")
-        except Exception as e:
-            logger.warning(f"点击 checkbox 失败: {e}")
-            sb.switch_to_default_content()
-            return False
-
-        sb.switch_to_default_content()
-        sb.sleep(4)  # 等待验证弹窗
-
-        # Step 2: 检查是否直接通过（无需图片）
-        token = get_recaptcha_token(sb)
-        if token:
-            logger.info("验证码直接通过！")
-            return True
-
-        # Step 3: 循环处理图片验证（通常 5-6 轮）
-        for rnd in range(1, 10):  # 最多 9 轮
-            logger.info(f"--- 第 {rnd} 轮验证 ---")
-
-            # 3a. 找到验证码挑战 iframe
-            cap_frame = find_captcha_frame(sb)
-            if not cap_frame:
-                logger.info("验证码弹窗未出现")
-                break
-
-            # 3b. 获取验证问题
-            question = get_question_text(sb)
-            if not question:
-                logger.warning("未获取到验证问题")
-                break
-            logger.info(f"问题: {question}")
-
-            # 3c. 截图验证码网格
-            grid_b64 = capture_grid(sb)
-            if not grid_b64:
-                logger.warning("截图网格失败")
-                break
-
-            # 3d. 判断网格类型 & AI 识别
-            gtype = detect_grid_type(sb)
-            logger.info(f"网格类型: {gtype}")
-            nums = ai_solve_image_captcha(grid_b64, question, gtype)
-            if not nums:
-                logger.warning("AI 未返回有效答案")
-                break
-
-            # 3e. 点击对应的格子
-            click_tiles(sb, nums)
-            sb.sleep(1)
-
-            # 3f. 点击 Verify 按钮
-            try:
-                sb.find_element("#recaptcha-verify-button").click()
-                logger.info("已点击 Verify")
-            except Exception as e:
-                logger.warning(f"点击 Verify 失败: {e}")
-
-            sb.sleep(4)  # 等待反馈
-
-            # 3g. 检查是否拿到 token
-            token = get_recaptcha_token(sb)
-            if token:
-                logger.info(f"验证通过！token: {token[:30]}...")
-                return True
-
-            # 3h. 检查是否出现新一轮验证
-            new_frame = find_captcha_frame(sb)
-            if not new_frame:
-                logger.info("弹窗消失，验证可能通过")
-                break
-
-        # 最终检查
-        token = get_recaptcha_token(sb)
-        if token:
-            logger.info(f"最终拿到 token: {token[:30]}...")
-            return True
-        
-        logger.warning("验证未通过（AI 识别可能不够准确）")
-        return False
-
-    except Exception as e:
-        logger.error(f"验证过程出错: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return False
-
-
-# ─── 辅助函数 ──────────────────────────────────────────────────
-def get_recaptcha_token(sb: "SB") -> str:
-    """获取页面中的 g-recaptcha-response 值"""
-    try:
-        t = sb.execute_script(
+        t = sb.driver.execute_script(
             "var el=document.getElementById('g-recaptcha-response');"
             "return el?el.value:'';")
         return t if (t and len(t) > 50) else ""
@@ -311,201 +162,266 @@ def get_recaptcha_token(sb: "SB") -> str:
         return ""
 
 
-def find_captcha_frame(sb: "SB"):
+def find_challenge_iframe(sb):
     """
-    找到 reCAPTCHA 验证码挑战弹窗的 iframe。
-    返回 iframe element 或 None。
+    找到验证码挑战弹窗的 iframe。
+    Selenium 原生 API, 不依赖 SeleniumBase 封装。
     """
     try:
-        frames = sb.find_elements("css=iframe")
-        for f in frames:
-            sb.switch_to_default_content()
+        sb.switch_to.default_content()
+        frames = find_all_iframes(sb)
+        for frame in frames:
+            sb.switch_to.frame(frame)
+            # 检查是否有 rc-imageselect (验证码网格)
             try:
-                sb.driver.switch_to.frame(f)
-                title = (f.get_attribute("title") or "").lower()
-                if "recaptcha challenge" in title:
-                    logger.info("找到验证码弹窗 iframe")
-                    return f
+                sb.driver.find_element(By.ID, "rc-imageselect")
+                sb.switch_to.default_content()
+                return frame
             except Exception:
-                continue
-        
-        # 备用：通过 src 找
-        sb.switch_to_default_content()
-        frames = sb.find_elements("css=iframe[src*='recaptcha']")
-        for f in frames:
-            sb.switch_to_default_content()
-            try:
-                sb.driver.switch_to.frame(f)
-                # 检查页面是否有验证码网格
-                try:
-                    sb.find_element("#rc-imageselect")
-                    logger.info("通过 src 属性找到验证码弹窗")
-                    return f
-                except Exception:
-                    pass
-            except Exception:
-                continue
-        
-        sb.switch_to_default_content()
+                pass
+            # 或者看 title 属性
+            title = (frame.get_attribute("title") or "").lower()
+            if "recaptcha challenge" in title:
+                sb.switch_to.default_content()
+                return frame
+            sb.switch_to.default_content()
         return None
-    except Exception as e:
-        logger.debug(f"找 iframe 出错: {e}")
-        sb.switch_to_default_content()
-        return None
-
-
-def get_question_text(sb: "SB") -> str:
-    """获取验证码问题文本"""
-    try:
-        # 尝试多个可能的选择器
-        selectors = [
-            ".rc-imageselect-instructions strong",
-            ".rc-imageselect-instructions",
-            ".rc-doscaptcha-header",
-        ]
-        for sel in selectors:
-            try:
-                el = sb.find_element(sel)
-                txt = el.text.strip()
-                if txt and len(txt) > 3:
-                    # 清理文本
-                    txt = re.split(r'如果没有|如果没|请点击|Please try again', txt)[0].strip()
-                    if txt:
-                        return txt
-            except Exception:
-                continue
     except Exception:
-        pass
+        sb.switch_to.default_content()
+        return None
+
+
+def get_question_text(sb):
+    """获取验证码问题文本"""
+    selectors = [
+        (By.CSS_SELECTOR, ".rc-imageselect-instructions strong"),
+        (By.CSS_SELECTOR, ".rc-imageselect-instructions"),
+        (By.CSS_SELECTOR, ".rc-doscaptcha-header"),
+    ]
+    for by, sel in selectors:
+        try:
+            el = sb.driver.find_element(by, sel)
+            txt = el.text.strip()
+            if txt and len(txt) > 3:
+                txt = re.split(r'如果没有|如果没|请点击', txt)[0].strip()
+                if txt:
+                    return txt
+        except Exception:
+            continue
     return "请识别图片"
 
 
-def detect_grid_type(sb: "SB") -> str:
-    """检测网格类型：3x3 还是 3x4"""
+def detect_grid_type(sb):
     try:
-        tiles = sb.find_elements(".rc-imageselect-tile")
+        tiles = sb.driver.find_elements(By.CSS_SELECTOR, ".rc-imageselect-tile")
         if len(tiles) == 12:
             return "grid_3x4"
-        return "grid"  # 默认 3x3
+        return "grid"
     except Exception:
         return "grid"
 
 
-def capture_grid(sb: "SB") -> str:
-    """截取验证码网格区域的 base64 图片"""
+def capture_grid(sb):
     try:
-        grid_el = sb.find_element("#rc-imageselect")
-        return grid_el.screenshot_as_base64
+        el = sb.driver.find_element(By.ID, "rc-imageselect")
+        return el.screenshot_as_base64
     except Exception:
         try:
-            # 兜底：截取整个页面
             return sb.get_screenshot_as_base64()
         except Exception:
             return ""
 
 
-def click_tiles(sb: "SB", nums: list) -> None:
-    """点击验证码网格中指定编号的格子（1-based）"""
+def click_tiles(sb, nums):
+    tiles = sb.driver.find_elements(By.CSS_SELECTOR, ".rc-imageselect-tile")
+    logger.info(f"共 {len(tiles)} 个格，将点击 {nums}")
+    for n in nums:
+        i = n - 1
+        if 0 <= i < len(tiles):
+            try:
+                tiles[i].click()
+                logger.info(f"  ✅ 点了第 {n} 个")
+                time.sleep(0.3)
+            except Exception as e:
+                logger.warning(f"  点 {n} 失败: {e}")
+        else:
+            logger.warning(f"  {n} 格超出范围")
+
+
+# ─── reCAPTCHA 求解主流程 ──────────────────────────────────────
+def solve_recaptcha(sb) -> bool:
+    sb.sleep(2)
+
+    # Step 1: 找 checkbox iframe → 点击
+    logger.info("寻找 checkbox...")
     try:
-        tiles = sb.find_elements(".rc-imageselect-tile")
-        logger.info(f"共 {len(tiles)} 个格子，将点击 {nums}")
-        for n in nums:
-            i = n - 1  # 转 0-based
-            if 0 <= i < len(tiles):
-                try:
-                    tiles[i].click()
-                    logger.info(f"  点击了第 {n} 个")
-                    time.sleep(0.3)
-                except Exception as e:
-                    logger.warning(f"  点击第 {n} 个失败: {e}")
-            else:
-                logger.warning(f"  第 {n} 个超出范围（共 {len(tiles)} 个）")
+        sb.switch_to.default_content()
+        frames = find_all_iframes(sb)
+        checkbox_found = False
+        for frame in frames:
+            try:
+                sb.switch_to.frame(frame)
+                cb = sb.driver.find_element(By.ID, "recaptcha-anchor")
+                cb.click()
+                logger.info("已点 checkbox")
+                checkbox_found = True
+                sb.switch_to.default_content()
+                break
+            except Exception:
+                sb.switch_to.default_content()
+                continue
+        
+        if not checkbox_found:
+            logger.warning("未找到 checkbox")
+            return False
     except Exception as e:
-        logger.warning(f"点格子时出错: {e}")
+        logger.warning(f"点 checkbox 出错: {e}")
+        return False
+
+    sb.sleep(4)
+
+    # Step 2: 检查直接通过
+    token = get_recaptcha_token(sb)
+    if token:
+        logger.info("直接通过！")
+        return True
+
+    # Step 3: 循环图片验证（5-6 轮）
+    for rnd in range(1, 12):
+        logger.info(f"--- 第 {rnd} 轮 ---")
+
+        # 找挑战 iframe
+        cap_frame = find_challenge_iframe(sb)
+        if not cap_frame:
+            logger.info("弹窗未出现")
+            break
+
+        # 获取问题
+        question = get_question_text(sb)
+        logger.info(f"问题: {question[:80]}")
+
+        # 截图网格
+        grid_b64 = capture_grid(sb)
+        if not grid_b64:
+            logger.warning("截图失败")
+            break
+
+        # 类型判断 & AI
+        gtype = detect_grid_type(sb)
+        logger.info(f"网格: {gtype}")
+        nums = ai_solve(grid_b64, question, gtype)
+        if not nums:
+            logger.warning("AI 未返回")
+            break
+
+        # 点击格子
+        click_tiles(sb, nums)
+        sb.sleep(1)
+
+        # 点 Verify
+        try:
+            vb = sb.driver.find_element(By.ID, "recaptcha-verify-button")
+            vb.click()
+            logger.info("已点 Verify")
+        except Exception as e:
+            logger.warning(f"Verify 出错: {e}")
+
+        sb.sleep(5)
+
+        # 检查 token
+        token = get_recaptcha_token(sb)
+        if token:
+            logger.info(f"✅ {token[:30]}...")
+            return True
+
+        # 检查弹窗是否还在
+        new_frame = find_challenge_iframe(sb)
+        if not new_frame:
+            logger.info("弹窗消失")
+            break
+
+    token = get_recaptcha_token(sb)
+    if token:
+        logger.info(f"✅ {token[:30]}...")
+        return True
+    logger.warning("验证失败")
+    return False
 
 
 # ─── 登录 ─────────────────────────────────────────────────────────
-def do_login(sb: "SB") -> bool:
-    """FOSSBilling 登录流程"""
+def do_login(sb) -> bool:
     if not VPS8_EMAIL or not VPS8_PASSWORD:
-        logger.warning("邮箱/密码未配置")
+        logger.warning("未配置邮箱/密码")
         return False
 
     for attempt in range(1, 4):
-        logger.info(f"登录尝试 [{attempt}/3]...")
+        logger.info(f"登录 [{attempt}/3]...")
         sb.open(LOGIN_URL)
         sb.sleep(4)
 
-        # 检查是否已登录
+        # 检查已登录
         if "/login" not in sb.get_current_url():
-            logger.info("已处于登录状态")
             return True
 
         # 填表单
         try:
             sb.type("#email", VPS8_EMAIL)
             sb.type("#password", VPS8_PASSWORD)
-            logger.info("已填表单")
+            logger.info("已填表")
         except Exception as e:
-            logger.error(f"填表单失败: {e}")
+            logger.error(f"填表: {e}")
             return False
 
         # 解验证码
         if not solve_recaptcha(sb):
-            logger.warning(f"验证码失败 ({attempt}/3)")
+            logger.warning(f"验证码失败 {attempt}/3")
             continue
         sb.sleep(1)
 
-        # 提交登录
+        # 点登录
         try:
             sb.click('button[type="submit"]')
             sb.sleep(10)
-            logger.info("已点击登录")
         except Exception as e:
-            logger.error(f"点击登录失败: {e}")
+            logger.error(f"点登录: {e}")
             return False
 
-        # 检查结果
         cur = sb.get_current_url()
-        logger.info(f"当前 URL: {cur}")
+        logger.info(f"URL: {cur}")
         if "/login" not in cur:
-            logger.info("登录成功！")
-            cookies = sb.get_cookies()
             with open(OUTPUT_DIR / "cookies.json", "w") as f:
-                json.dump({"cookies": cookies, "time": datetime.now().isoformat()}, f, indent=2)
+                json.dump({"cookies": sb.get_cookies(),
+                           "time": datetime.now().isoformat()}, f, indent=2)
+            logger.info("✅ 登录成功！")
             return True
-
-        logger.warning(f"登录失败 ({attempt}/3)，仍在登录页")
+        logger.warning(f"失败 ({attempt}/3)")
         if attempt < 3:
             time.sleep(3)
 
-    logger.error("3 次登录尝试全部失败")
+    logger.error("3 次均失败")
     return False
 
 
-# ─── 签到 ─────────────────────────────────────────────────────────
-def do_signin(sb: "SB") -> str:
-    """在已登录状态下完成签到"""
+# ─── 签到 ──────────────────────────────────────────────────────
+def do_signin(sb) -> str:
     sb.open(SIGNIN_URL)
     sb.sleep(4)
     src = sb.get_page_source()
 
-    # 检查登录状态
     if "Login to your account" in src:
         return "Cookie 失效"
     if "已签到" in src:
-        return "今天已签到过了"
+        return "已签到过"
 
-    # 提取 CSRF Token
     m = re.search(r'name="CSRFToken"\s+value="(\w+)"', src)
     if not m:
         m = re.search(r'name="csrf-token"\s+content="(\w+)"', src)
     if not m:
         return "无法提取 CSRF Token"
-    
+
     csrf = m.group(1)
     cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in sb.get_cookies())
 
-    # 尝试 POST API 签到
     try:
         resp = requests.post(
             API_SIGNIN,
@@ -526,31 +442,19 @@ def do_signin(sb: "SB") -> str:
                     msg = j["error"]["message"]
                     if "已签到" in msg or "already" in msg.lower():
                         return "已签到"
-                    return f"API 错误: {msg}"
+                    return f"API: {msg}"
                 if "result" in j and j["result"] is not None:
                     return f"签到成功! {json.dumps(j['result'], ensure_ascii=False)[:200]}"
             except Exception:
                 if "签到成功" in resp.text or "已签到" in resp.text:
                     return "签到成功!"
     except Exception as e:
-        logger.warning(f"API 签到: {e}")
-
-    # 尝试页面按钮签到
-    try:
-        logger.info("尝试页面按钮签到...")
-        if "recaptcha" in sb.get_page_source().lower():
-            solve_recaptcha(sb)
-        sb.click("#points-signin-submit")
-        sb.sleep(6)
-        if "已签到" in sb.get_page_source():
-            return "签到成功! (页面按钮)"
-    except Exception as e:
-        logger.warning(f"按钮签到: {e}")
+        logger.warning(f"API: {e}")
 
     return "签到结果不确定"
 
 
-# ─── 主函数 ─────────────────────────────────────────────────────
+# ─── 主函数 ─────────────────────────────────────────────────────────
 def main():
     logger.info("=" * 50)
     logger.info("VPS8 每日签到")
@@ -572,7 +476,6 @@ def main():
             "--no-sandbox",
         ],
     ) as sb:
-        # 检查登录状态
         sb.open(SIGNIN_URL)
         sb.sleep(3)
         src = sb.get_page_source()
@@ -581,26 +484,24 @@ def main():
             logger.info("未登录，先登录...")
             if do_login(sb):
                 result = do_signin(sb)
-                ok = result.startswith("签到成功") or result.startswith("已签到")
+                ok = "成功" in result or "已签" in result
             else:
                 result = "登录失败"
         else:
-            logger.info("Cookie 有效，直接签到")
+            logger.info("Cookie 有效")
             result = do_signin(sb)
-            ok = result.startswith("签到成功") or result.startswith("已签到")
+            ok = "成功" in result or "已签" in result
 
-    # 发送通知
     icon = "✅" if ok else "❌"
     msg = (
-        f"🦞 <b>VPS8 签到结果</b>\n"
-        f"📅 日期: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-        f"🤖 AI: {AI_MODEL_NAME}\n"
+        f"VPS8 签到\n"
+        f"日期: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        f"AI: {AI_MODEL_NAME}\n"
         f"{icon} {result}\n"
-        f"🌐 {SIGNIN_URL}"
+        f"https://vps8.zz.cd/points/signin"
     )
     send_telegram(msg)
 
-    # GitHub Actions output
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a") as f:
             f.write(f"success={'true' if ok else 'false'}\n")
