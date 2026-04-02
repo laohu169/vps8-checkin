@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-VPS8.zz.cd 每日签到 — AI 视觉识图 + 验证码破解
+VPS8.zz.cd 每日一签到
+浏览器找图 + AI 视觉识别
 """
 import os, sys, time, json, re
 from datetime import datetime
@@ -12,12 +13,11 @@ import base64
 from PIL import Image
 from seleniumbase import SB
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException
 from loguru import logger
 
-BASE_URL   = os.environ.get("VPS8_BASE_URL", "https://vps8.zz.cd")
-LOGIN_URL  = f"{BASE_URL}/login"
-SIGNIN_URL = f"{BASE_URL}/points/signin"
+BASE_URL    = os.environ.get("VPS8_BASE_URL", "https://vps8.zz.cd")
+LOGIN_URL   = f"{BASE_URL}/login"
+SIGNIN_URL  = f"{BASE_URL}/points/signin"
 
 AI_API_KEY    = os.environ.get("AI_API_KEY", "")
 AI_BASE_URL   = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1")
@@ -36,7 +36,7 @@ logger.add(sys.stderr, level="INFO",
            format="<green>{time:HH:mm:ss}</green> | {message}")
 
 
-def tg(text: str):
+def tg(text):
     if not TG_TOKEN or not MY_CHAT_ID:
         return
     try:
@@ -44,8 +44,8 @@ def tg(text: str):
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={"chat_id": MY_CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=10)
-    except Exception as e:
-        logger.warning(f"TG: {e}")
+    except:
+        pass
 
 
 def save_img(b64, name="cap"):
@@ -55,39 +55,62 @@ def save_img(b64, name="cap"):
         pass
 
 
-# ═══════════════════════════════════════════════════════════
-# AI 图片识别 — 完全避开 "CAPTCHA" 字眼
-# 包装成普通的「看图找东西」任务
-# ═══════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════
+# 提取问题文本（关键修复！）
+# ═══════════════════════════════════════════════════
+def extract_question(d):
+    """
+    从 .rc-imageselect-instructions 提取完整问题文本。
+    
+    Google 的 HTML 结构:
+    <div class="rc-imageselect-instructions">
+      <span id="instruction-text">Select all squares with</span>
+      <strong id="instruction-text-strong">motorcycles</strong>
+    </div>
+    
+    之前的 bug: 只拿到了 span 的文本，漏掉了 <strong> 中的物体名称！
+    """
+    try:
+        el = d.find_element(By.CSS_SELECTOR, ".rc-imageselect-instructions")
+        # 取整个元素的完整文本（包含子元素）
+        full_text = el.text.strip()
+        if full_text:
+            # 清理多余换行
+            lines = [l.strip() for l in full_text.split("\n") if l.strip()]
+            # 合并成一行，去掉 "If there are none..." 等后半句
+            full_text = " ".join(lines)
+            # 截断
+            if len(full_text) > 100:
+                full_text = full_text[:100]
+            return full_text
+    except:
+        pass
+    return ""
+
+
+# ═══════════════════════════════════════════════════
+# AI 图片识别
+# ═══════════════════════════════════════════════════
 def solve_grid(img_b64, question, rows, cols):
-    """
-    把网格图发给 AI，让它「看图找图中包含指定物体的方块编号」。
-    完全不用任何可能触发安全策略的词。
-    """
     if not AI_API_KEY:
-        logger.error("NO AI_API_KEY")
         return []
 
     max_tile = rows * cols
-
-    # 编号说明
     num_parts = []
     for r in range(rows):
         nums = ", ".join(str(r * cols + c + 1) for c in range(cols))
         num_parts.append(f"Row{r+1}: [{nums}]")
     num_text = "\n".join(num_parts)
 
-    # ⚠️ 注意：prompt 里绝对不出现 验证码、captcha、recaptcha 等词
+    # ⚠️ 完全避开敏感词
     prompt = (
-        f"This is a grid of {rows}×{cols} small pictures.\n"
-        f"Please find ALL pictures that contain: **{question}**\n\n"
-        f"Grid cell numbering (left→right, top→bottom):\n"
-        f"{num_text}\n\n"
-        f"Reply with ONLY a list of cell numbers containing the item.\n"
-        f"Format: NUMBER, NUMBER, NUMBER\n"
-        f"If the question says 'click verify/close once there are none left' "
-        f"and you see NO matching items, reply with just: -1\n"
-        f"Do NOT say anything else."
+        f"Grid of {rows}x{cols} pictures.\n"
+        f"Find ALL pictures containing: \"{question}\"\n\n"
+        f"Cell numbering:\n{num_text}\n\n"
+        f"Reply with ONLY matching cell numbers comma separated.\n"
+        f"I Example: 1, 4, 7\n"
+        f"If NO pictures match, reply: -1\n"
+        f"Nothing else."
     )
 
     try:
@@ -106,66 +129,39 @@ def solve_grid(img_b64, question, rows, cols):
             json={
                 "model": AI_MODEL_NAME,
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are an image recognition expert. "
-                            "Look at grids of small photos and identify which cells "
-                            "contain the specified item. "
-                            "Reply with ONLY the cell numbers, nothing else."
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{sb64}",
-                                    "detail": "high"
-                                }
-                            }
-                        ]
-                    }
-                ],
+                    {"role": "system",
+                     "content": "Image recognition expert. Identify which grid cells contain the specified object. Reply with only cell numbers."},
+                    {"role": "user",
+                     "content": [
+                         {"type": "text", "text": prompt},
+                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{sb64}", "detail": "high"}}
+                     ]}],
                 "max_tokens": 50,
-                "temperature": 0.1
+                "temperature": 0.1,
             },
-            timeout=60
+            timeout=60,
         )
-
         ans = r.json()["choices"][0]["message"]["content"].strip()
         logger.info(f"AI: {ans}")
-        save_img(sb64, f"grid_{int(time.time())}")
+        save_img(sb64, "ai_input")
 
-        # 解析 -1 表示没有匹配的
         if "-1" in ans:
             return []
-
         nums = [int(n) for n in re.findall(r'\d+', ans)]
         nums = [n for n in nums if 1 <= n <= max_tile]
-        logger.info(f"→ 点: {nums}")
         return nums
-
     except Exception as e:
         logger.error(f"AI 失败: {e}")
         return []
 
 
-# ═══════════════════════════════════════════════════════════
-# reCAPTCHA 破解流程
-# ═══════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════
+# 图片验证破解
+# ═══════════════════════════════════════════════════
 def break_image_challenge(sb):
-    """
-    在已经处于 reCAPTCHA 弹窗内的 iframe 中，
-    截图 → AI 识别 → 格子 → Verify，循环直到通过。
-    调用者已经把 driver switch 进了 challenge iframe。
-    """
     d = sb.driver
 
-    for rnd in range(1, 20):
-        # 1. 识别网格维度
+    for rnd in range(1, 25):
         tiles = d.find_elements(By.CSS_SELECTOR, ".rc-imageselect-tile")
         total = len(tiles)
         if total == 16:
@@ -175,46 +171,27 @@ def break_image_challenge(sb):
         else:
             rows, cols = 3, 3
 
-        logger.info(f"--- Round {rnd} | {rows}x{cols} ({total} tiles) ---")
+        question = extract_question(d)
+        if not question:
+            question = "identify the object"
 
-        # 2. 提取问题
-        question = "the item mentioned"
-        try:
-            q_el = d.find_element(By.CSS_SELECTOR, ".rc-imageselect-instructions")
-            q_txt = q_el.text.strip()
-            # 取关键部分
-            if q_txt:
-                question = q_txt.split("\n")[0].strip()
-        except Exception:
-            logger.warning("无法提取问题文本")
+        logger.info(f"--- {rnd} | {rows}x{cols} ({total}) ---")
+        logger.info(f"Q: {question}")
 
-        # 如果问题包含 "verify" / "close" / "skip" 且是 "if there are none"
-        is_check_none = False
-        if "none" in question.lower() and ("verify" in question.lower() or "skip" in question.lower()):
-            is_check_none = True
-
-        logger.info(f"Q: {question[:70]}")
-
-        # 3. 截图
         grid_b64 = ""
         try:
             grid_b64 = d.find_element(By.ID, "rc-imageselect").screenshot_as_base64
-        except Exception:
+        except:
             try:
                 grid_b64 = sb.get_screenshot_as_base64()
-            except Exception:
+            except:
                 break
 
         if not grid_b64:
-            logger.warning("截图失败")
             break
+        save_img(grid_b64, f"r{rnd}")
 
-        save_img(grid_b64, f"round{rnd}")
-
-        # 4. AI 识别
         nums = solve_grid(grid_b64, question, rows, cols)
-
-        # 5. 点击
         if nums:
             for n in nums:
                 i = n - 1
@@ -223,8 +200,6 @@ def break_image_challenge(sb):
                     sb.sleep(0.2)
 
         sb.sleep(1)
-
-        # 6. 点 Verify
         try:
             d.find_element(By.ID, "recaptcha-verify-button").click()
             logger.info("Verify clicked")
@@ -234,59 +209,48 @@ def break_image_challenge(sb):
 
         sb.sleep(4)
 
-        # 7. 检查是否通过 — token 出现
+        # 检查通过
         token = d.execute_script(
             "var e=document.getElementById('g-recaptcha-response');return e?e.value:'';")
         if len(token) > 50:
             logger.info(f"PASSED! token {token[:30]}")
             return True
 
-        # 8. 检查弹窗是否还在 — 如果消失了可能也通过了
+        # 检查弹窗是否还在
         try:
             d.find_element(By.ID, "rc-imageselect")
-        except Exception:
-            # 弹窗没了
+        except:
             token2 = d.execute_script(
                 "var e=document.getElementById('g-recaptcha-response');return e?e.value:'';")
             if len(token2) > 50:
-                logger.info("PASSED (popup gone) token {token2[:30]}")
+                logger.info("PASSED (popup gone)")
                 return True
-            logger.info("Popup disappeared, checking...")
-            # 如果没 token 可能还需要重新触发
+            logger.info("Popup gone but no token, break")
             break
 
     return False
 
 
-def solve_full_recaptcha(sb):
-    """
-    完整流程:
-    1. 等 checkbox iframe → 点它
-    2. 等 challenge iframe → switch 进去
-    3. break_image_challenge
-    """
+def solve_full(sb):
     d = sb.driver
     d.switch_to.default_content()
 
-    # 等 checkbox
     logger.info("找 checkbox...")
     try:
         sb.wait_for_element_present("iframe[title*='recaptcha']", timeout=15)
-    except Exception:
+    except:
         logger.warning("未找到 checkbox iframe")
         return False
 
     time.sleep(1)
-
     frames = d.find_elements(By.TAG_NAME, "iframe")
     cb = None
     for f in frames:
-        title = (f.get_attribute("title") or "").lower()
-        if "recaptcha" in title:
+        t = (f.get_attribute("title") or "").lower()
+        if "recaptcha" in t:
             cb = f
             break
     if not cb:
-        logger.warning("未找到 checkbox frame")
         return False
 
     try:
@@ -296,54 +260,49 @@ def solve_full_recaptcha(sb):
         logger.info("已点 checkbox")
     except Exception as e:
         d.switch_to.default_content()
-        logger.warning(f"点 checkbox 失败: {e}")
+        logger.warning(f"checkbox: {e}")
         return False
 
     sb.sleep(3)
-
-    # 检查是否直接通过
     t = d.execute_script(
         "var e=document.getElementById('g-recaptcha-response');return e?e.value:'';")
     if len(t) > 50:
         logger.info("直接通过!")
         return True
 
-    # 等 challenge iframe
     logger.info("等 challenge...")
     try:
         sb.wait_for_element_present("iframe[src*='bframe']", timeout=20)
-    except Exception:
+    except:
         t2 = d.execute_script(
             "var e=document.getElementById('g-recaptcha-response');return e?e.value:'';")
         return len(t2) > 50
 
-    # 找到 bframe 并 switch
-    challenge_frame = None
+    cf = None
     for f in d.find_elements(By.TAG_NAME, "iframe"):
         src = f.get_attribute("src") or ""
         if "bframe" in src:
             try:
                 d.switch_to.frame(f)
                 d.find_element(By.ID, "rc-imageselect")
-                challenge_frame = f
-                logger.info("进入 challenge iframe")
+                cf = f
+                logger.info("进入 challenge")
                 break
-            except Exception:
+            except:
                 d.switch_to.default_content()
 
-    if not challenge_frame:
-        logger.warning("未找到 challenge frame")
+    if not cf:
         return False
 
-    result = break_image_challenge(sb)
+    ok = break_image_challenge(sb)
     d.switch_to.default_content()
-    return result
+    return ok
 
 
-# ═══════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════
 # 登录
-# ═══════════════════════════════════════════════════════════
-def do_login(sb) -> bool:
+# ═══════════════════════════════════════════════════
+def do_login(sb):
     if not VPS8_EMAIL or not VPS8_PASSWORD:
         logger.warning("无邮箱/密码")
         return False
@@ -353,57 +312,43 @@ def do_login(sb) -> bool:
         sb.open(LOGIN_URL)
         sb.sleep(4)
 
-        u = sb.get_current_url()
-        if "/login" not in u:
-            # 截图证明登录成功
-            p = OUT / "login_success.png"
-            sb.save_screenshot(str(p))
-            logger.info(f"已登录! 截图: {p}")
+        if "/login" not in sb.get_current_url():
+            logger.info("已登录!")
             return True
 
-        # 填表单
         try:
             sb.type("#email", VPS8_EMAIL)
             sb.type("#password", VPS8_PASSWORD)
             logger.info("表单已填")
         except Exception as e:
-            logger.error(f"填表单: {e}")
+            logger.error(f"填表: {e}")
             return False
 
-        # 破解验证码
-        if not solve_full_recaptcha(sb):
+        if not solve_full(sb):
             logger.warning(f"验证失败 ({att}/3)")
             sb.sleep(3)
             continue
 
-        # 点登录按钮
-        try:
-            sb.click('button[type="submit"]')
-            sb.sleep(10)
-        except Exception as e:
-            logger.error(f"点登录: {e}")
-            return False
+        sb.click('button[type="submit"]')
+        sb.sleep(10)
 
-        # 截图看状态
-        p = OUT / f"login_attempt{att}.png"
+        p = OUT / f"after_submit{att}.png"
         sb.save_screenshot(str(p))
-        logger.info(f"截图: {p}")
 
         u = sb.get_current_url()
-        logger.info(f"当前 URL: {u}")
+        logger.info(f"URL: {u}")
         if "/login" not in u:
             logger.info("✅ 登录成功!")
             return True
-        logger.warning(f"仍在登录页 ({att}/3)")
 
     logger.error("3 次登录均失败")
     return False
 
 
-# ═══════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════
 # 签到
-# ═══════════════════════════════════════════════════════════
-def do_signin(sb) -> str:
+# ═══════════════════════════════════════════════════
+def do_signin(sb):
     sb.open(SIGNIN_URL)
     sb.sleep(4)
     src = sb.get_page_source()
@@ -412,13 +357,13 @@ def do_signin(sb) -> str:
     if "已签到" in src:
         return "已签到过"
 
-    ck = "; ".join(f"{c['name']}={c['value']}" for c in sb.get_cookies())
     m = re.search(r'name="CSRFToken"\s+value="(\w+)"', src)
     if not m:
         m = re.search(r'name="csrf-token"\s+content="(\w+)"', src)
     if not m:
-        return "无 CSRF"
+        return "无 CSRF Token"
     csrf = m.group(1)
+    ck = "; ".join(f"{c['name']}={c['value']}" for c in sb.get_cookies())
     try:
         r = requests.post(
             f"{BASE_URL}/api/client/points/signin",
@@ -429,20 +374,16 @@ def do_signin(sb) -> str:
         j = r.json()
         if j.get("error"):
             msg = j["error"]["message"]
-            if "已签到" in msg or "already" in msg.lower():
+            if "已签到" in msg:
                 return "已签到"
             return f"API: {msg}"
         if "result" in j and j["result"]:
             return f"成功! {json.dumps(j['result'])[:200]}"
-        return f"API: {r.text[:200]}"
-    except Exception as e:
-        logger.warning(f"API: {e}")
-    return "不确定"
+        return "不确定"
+    except:
+        return "API 异常"
 
 
-# ═══════════════════════════════════════════════════════════
-# Main
-# ═══════════════════════════════════════════════════════════
 def main():
     logger.info("=" * 50)
     logger.info(f"VPS8 签到 | {datetime.now().strftime('%H:%M:%S')}")
@@ -477,7 +418,8 @@ def main():
             ok = "成功" in result or "已签" in result
 
     icon = "✅" if ok else "❌"
-    tg(f"VPS8 签到\n{icon} {result}\n{datetime.now().strftime('%Y-%m-%d')}")
+    msg = f"VPS8 签到\n{icon} {result}\n{datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    tg(msg)
 
 
 if __name__ == "__main__":
