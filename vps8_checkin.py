@@ -350,7 +350,6 @@ def main():
 
     # 判断系统
     is_linux = sys.platform.startswith("linux")
-    uc_cdp_times = 2 if is_linux else 1
 
     with SB(
         uc=True,
@@ -362,7 +361,6 @@ def main():
             "--disable-infobars",
             "--no-sandbox",
         ],
-        uc_cdp_times=uc_cdp_times,
     ) as sb:
         # 设置 UA
         ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
