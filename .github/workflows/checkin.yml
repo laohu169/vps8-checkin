@@ -1,0 +1,24 @@
+name: VPS8 每日签到
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 执行签到
+        env:
+          VPS8_COOKIES: ${{ secrets.VPS8_COOKIES }}
+        run: |
+          node checkin.js
